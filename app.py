@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Streamlit SBOM → NOTICE generator
+
 - Upload SPDX JSON (incl. SPDX-Lite) and/or CycloneDX JSON.
 - Two buttons:
-  1) Offline mode: "Generate (from scanned SBOM only)"
-     *Produces NOTICE.md without external network calls.*
-  2) Online mode: "Generate (fetch from internet)"
-     *Fetches SPDX license texts and package artifacts (npm/PyPI/Maven/NuGet/RubyGems/Golang)
-      to enrich license texts & copyrights.*
+  1) Offline: "Generate (from scanned SBOM only)"  → no external calls (SBOM-only).
+  2) Online : "Generate (fetch from internet)"     → fetch SPDX license texts and
+     package artifacts (npm, PyPI, Maven, NuGet, RubyGems, Golang) to enrich license texts.
 
-Disclaimer: This automates attribution but is not legal advice—review final NOTICE for completeness.
+Disclaimer: This automates attribution but is not legal advice — always review the output.
 """
 
 import io
@@ -25,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 from packaging.version import parse as parse_version
-from requests.utils import quote  # for URL-encoding module paths (Go proxy)
+from urllib.parse import quote as urlquote  # for URL-encoding Go module paths
 
 # --------------------------- Constants ---------------------------
 
@@ -44,12 +43,11 @@ REQ_TIMEOUT = 20
 st.set_page_config(page_title="SBOM → NOTICE generator", page_icon="🧾", layout="centered")
 st.title("🧾 SBOM → NOTICE generator")
 
-st.markdown("""
-Upload **SPDX JSON** (including SPDX‑Lite) and/or **CycloneDX JSON**.
-Then choose either:
-- **🗂️ Generate (from scanned SBOM only)** — uses SBOM content only *(offline)*.
-- **🌐 Generate (fetch from internet)** — enriches with SPDX License List & package artifacts *(online)*.
-""")
+st.markdown(
+    "Upload **SPDX JSON** (including SPDX‑Lite) and/or **CycloneDX JSON**. Then choose:\n\n"
+    "- **🗂️ Generate (from scanned SBOM only)** — uses SBOM content only *(offline)*.\n"
+    "- **🌐 Generate (fetch from internet)** — enriches with SPDX License List & package artifacts *(online)*.\n"
+)
 
 uploaded_files = st.file_uploader(
     "Upload one or more SBOM files (SPDX JSON or CycloneDX JSON)",
@@ -69,10 +67,11 @@ col1, col2 = st.columns(2)
 go_offline = col1.button("🗂️ Generate (from scanned SBOM only)", type="primary", disabled=not uploaded_files)
 go_online  = col2.button("🌐 Generate (fetch from internet)", type="secondary", disabled=not uploaded_files)
 
-st.caption("""
-**Tip:** Offline mode never calls external APIs.  
-Online mode fetches canonical SPDX license texts and attempts to download published artifacts (npm/PyPI/Maven/NuGet/RubyGems/Go) to extract `LICENSE` / `NOTICE` / `COPYRIGHT`.
-""")
+st.caption(
+    "**Tip:** Offline mode never calls external APIs.  "
+    "Online mode fetches canonical SPDX license texts and attempts to download published artifacts "
+    "(npm/PyPI/Maven/NuGet/RubyGems/Go) to extract `LICENSE` / `NOTICE` / `COPYRIGHT`."
+)
 
 # ------------------------ Helpers -------------------------------
 
@@ -121,6 +120,8 @@ def resolve_spdx_urls(pkg: dict) -> Tuple[Optional[str], Optional[str]]:
             source_url = locator
     return source_url, purl
 
+# ------------------------ Parsing -------------------------------
+
 def parse_spdx(doc: dict) -> Tuple[List[dict], Dict[str,str]]:
     comps, license_texts = [], {}
     # SPDX extracted license texts (if present)
@@ -143,8 +144,9 @@ def parse_spdx(doc: dict) -> Tuple[List[dict], Dict[str,str]]:
             src_url, purl = resolve_spdx_urls(pkg)
             comps.append({
                 "name": name, "version": version, "license": license_str,
-                "copyright": cpr, "source_url": src_url,
-                "purl": purl, "source": "spdx", "provenance": {}
+                "copyright": cpr,
+                "source_url": src_url, "purl": purl,
+                "source": "spdx", "provenance": {}
             })
         return comps, license_texts
 
@@ -208,10 +210,13 @@ def parse_cyclonedx(doc: dict) -> List[dict]:
 
         comps.append({
             "name": name, "version": version, "license": license_str,
-            "copyright": cpr, "source_url": source_url,
-            "purl": purl, "source": "cdx", "provenance": {}
+            "copyright": cpr,
+            "source_url": source_url, "purl": purl,
+            "source": "cdx", "provenance": {}
         })
     return comps
+
+# ------------------------ Merge & de-dupe ------------------------
 
 def key_of(c: dict) -> Tuple[str,str]:
     if c.get("purl"):
@@ -241,6 +246,8 @@ def dedupe_merge(components: List[dict]) -> List[dict]:
     res.sort(key=lambda x: ((x.get("name") or "").lower(), x.get("version") or ""))
     return res
 
+# ------------------------ SPDX license texts ---------------------
+
 @st.cache_data(show_spinner=False)
 def fetch_spdx_text(license_id: str) -> Optional[str]:
     try:
@@ -257,9 +264,11 @@ def split_license_expression(expr: str) -> List[str]:
     tokens = re.split(r'[^A-Za-z0-9\.\-\+]+', expr)
     return [t for t in tokens if t]
 
+# ------------------------ Archive extraction ---------------------
+
 def extract_texts_from_archive_bytes(buf: bytes) -> Dict[str,str]:
     texts = {}
-    # Try tar archives (npm tgz or sdist tar.gz / RubyGems inner tar)
+    # Try tar archives (npm tgz / PyPI sdist / RubyGems inner tar)
     try:
         fileobj = io.BytesIO(buf)
         with tarfile.open(fileobj=fileobj, mode="r:*") as tf:
@@ -274,13 +283,15 @@ def extract_texts_from_archive_bytes(buf: bytes) -> Dict[str,str]:
         if texts: return texts
     except Exception:
         pass
-    # Try zip/jar archives (Maven, NuGet, Go module zip)
+    # Try zip/jar archives (Maven / NuGet / Go module zip)
     try:
         with zipfile.ZipFile(io.BytesIO(buf)) as zf:
             for nm in zf.namelist():
                 base = os.path.basename(nm)
                 up = base.upper()
-                if up.startswith(("LICENSE","NOTICE","COPYING","COPYRIGHT")) or "LICENSE" in up or "NOTICE" in up or "COPYRIGHT" in up or "COPYING" in up or "META-INF" in up:
+                if (up.startswith(("LICENSE","NOTICE","COPYING","COPYRIGHT"))
+                    or "LICENSE" in up or "NOTICE" in up or "COPYRIGHT" in up or "COPYING" in up
+                    or "META-INF" in up):
                     with zf.open(nm) as f:
                         data = f.read().decode("utf-8", errors="replace").strip()
                         if data:
@@ -290,7 +301,7 @@ def extract_texts_from_archive_bytes(buf: bytes) -> Dict[str,str]:
         pass
     return texts
 
-# ---------- Ecosystem fetchers (Online Mode) ----------
+# ------------------ Ecosystem fetchers (Online) ------------------
 
 @st.cache_data(show_spinner=False)
 def fetch_npm_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
@@ -351,10 +362,6 @@ def fetch_maven_license_texts(group: str, artifact: str, version: str) -> Dict[s
 
 @st.cache_data(show_spinner=False)
 def fetch_nuget_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
-    """
-    NuGet v3 flat container: https://api.nuget.org/v3-flatcontainer/<id>/<version>/<id>.<version>.nupkg
-    .nupkg is a ZIP; license files typically included in package content.
-    """
     texts = {}
     try:
         if not version: return texts
@@ -369,17 +376,12 @@ def fetch_nuget_license_texts(name: str, version: Optional[str]) -> Dict[str,str
 
 @st.cache_data(show_spinner=False)
 def fetch_rubygems_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
-    """
-    RubyGems download URL: https://rubygems.org/downloads/<name>-<version>.gem
-    .gem is a tar containing metadata.gz and data.tar.gz; license files in data.tar.gz.
-    """
     texts = {}
     try:
         if not version: return texts
         url = f"https://rubygems.org/downloads/{name}-{version}.gem"
         r = requests.get(url, timeout=REQ_TIMEOUT)
         if r.status_code != 200: return texts
-        # .gem is a tar; open and find data.tar.gz
         fileobj = io.BytesIO(r.content)
         with tarfile.open(fileobj=fileobj, mode="r:*") as tf:
             for m in tf.getmembers():
@@ -387,7 +389,6 @@ def fetch_rubygems_license_texts(name: str, version: Optional[str]) -> Dict[str,
                     f = tf.extractfile(m)
                     if not f: continue
                     buf = f.read()
-                    # open nested tar.gz
                     inner = io.BytesIO(buf)
                     with tarfile.open(fileobj=inner, mode="r:*") as inner_tf:
                         for im in inner_tf.getmembers():
@@ -405,15 +406,10 @@ def fetch_rubygems_license_texts(name: str, version: Optional[str]) -> Dict[str,
 
 @st.cache_data(show_spinner=False)
 def fetch_golang_license_texts(module_path: str, version: Optional[str]) -> Dict[str,str]:
-    """
-    Go proxy zip: https://proxy.golang.org/<module>/@v/<version>.zip
-    The zip contains the module source; license files typically at root or submodules.
-    """
     texts = {}
     try:
         if not version: return texts
-        # URL-encode module path (keep slashes)
-        mod_encoded = quote(module_path, safe="/")
+        mod_encoded = urlquote(module_path, safe="/")
         url = f"https://proxy.golang.org/{mod_encoded}/@v/{version}.zip"
         r = requests.get(url, timeout=REQ_TIMEOUT)
         if r.status_code == 200:
@@ -469,7 +465,6 @@ def fetch_license_texts_by_purl(purl: Optional[str], name: Optional[str], versio
             ver = version or (purl.split("@")[-1] if "@" in purl else None)
             texts.update(fetch_rubygems_license_texts(pkg, ver))
         elif purl and purl.startswith("pkg:golang/"):
-            # module path may include slashes
             rest = purl[len("pkg:golang/"):]
             module = rest.split("@")[0]
             ver = version or (purl.split("@")[-1] if "@" in purl else None)
@@ -481,6 +476,8 @@ def fetch_license_texts_by_purl(purl: Optional[str], name: Optional[str], versio
     except Exception:
         pass
     return texts
+
+# ------------------------ Rendering ------------------------------
 
 def extract_copyright_lines(text: str, max_lines: int = 8) -> Optional[str]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -520,7 +517,7 @@ def render_md(components: List[dict], title: str, license_texts_map: Dict[str,st
 # ------------------------ Processing ----------------------------
 
 def process_sboms(uploaded_files) -> Tuple[List[dict], Dict[str,str]]:
-    """Parse all uploaded files → (components, embedded_spdx_texts)"""
+    """Parse all uploaded files → (components, embedded_spdx_texts)."""
     all_components: List[dict] = []
     embedded_spdx_texts: Dict[str,str] = {}
 
@@ -544,7 +541,7 @@ def process_sboms(uploaded_files) -> Tuple[List[dict], Dict[str,str]]:
     return all_components, embedded_spdx_texts
 
 def generate_notice_offline(uploaded_files, title: str, include_spdx_texts: bool) -> str:
-    """Offline path: no external APIs; SBOM-only + embedded SPDX texts."""
+    """Offline path: SBOM-only + embedded SPDX texts. No external APIs."""
     comps, lic_texts_map = process_sboms(uploaded_files)
     if not comps:
         st.error("No components found across the uploaded files.")
@@ -554,7 +551,6 @@ def generate_notice_offline(uploaded_files, title: str, include_spdx_texts: bool
 
     appended_texts: Dict[str,str] = {}
     if include_spdx_texts and lic_texts_map:
-        # Only append texts actually referenced by license expressions
         used_ids = set()
         for c in merged:
             lic = c.get("license") or ""
@@ -596,10 +592,9 @@ def generate_notice_online(uploaded_files, title: str, include_spdx_texts: bool)
                     if txt:
                         appended_texts[lid] = txt
 
-        # 3) Fetch upstream license/notice files via ecosystem (npm/PyPI/Maven/NuGet/RubyGems/Golang) or GitHub
+        # 3) Fetch upstream license/notice files via ecosystems or GitHub
         fetched = fetch_license_texts_by_purl(c.get("purl"), c.get("name"), c.get("version"), c.get("source_url"))
         if fetched:
-            # If we only have license files (no SPDX id), mark license conservatively
             if not c.get("license"):
                 c["license"] = "Custom / See NOTICE"
             license_sources = []
@@ -608,7 +603,6 @@ def generate_notice_online(uploaded_files, title: str, include_spdx_texts: bool)
                 if key not in appended_texts:
                     appended_texts[key] = content
                 license_sources.append(fname)
-                # Derive copyright lines if missing
                 if not c.get("copyright"):
                     cp = extract_copyright_lines(content)
                     if cp:
@@ -639,16 +633,17 @@ if go_online:
         st.code(notice_md[:4000] + ("\n...\n" if len(notice_md)>4000 else ""), language="markdown")
         st.download_button("⬇️ Download NOTICE.md", notice_md.encode("utf-8"), file_name="NOTICE.md", mime="text/markdown")
 
-# ------------------------ Footnotes ------------------------------
+# ------------------------ Footer -------------------------------
 
 st.divider()
-st.markdown(
+refs = (
     "### References\n"
-    "- SPDX License List / Tools: canonical license texts & tools ecosystem — https://spdx.dev/use/spdx-tools/\n\n"
-    "- Package URL (PURL) specification — https://github.com/package-url/purl-spec\n\n"
-    "- npm registry metadata (dist.tarball) — https://github.com/npm/registry/blob/main/docs/responses/package-metadata.md\n\n"
-    "- PyPI JSON API (release file URLs) — https://docs.pypi.org/api/json/\n\n"
-    "- Maven Central publishing requirements (sources/javadocs) — https://central.sonatype.org/publish/requirements/\n\n"
-    "- NuGet v3 flat container (nupkg download) — https://learn.microsoft.com/nuget/api/package-base-address-resource\n\n"
-    "- RubyGems downloads — https://guides.rubygems.org/rubygems-org-api/\n\n"
+    "- SPDX License List / Tools — https://spdx.dev/use/spdx-tools/\n"
+    "- Package URL (PURL) specification — https://github.com/package-url/purl-spec\n"
+    "- npm registry metadata (dist.tarball) — https://github.com/npm/registry/blob/main/docs/responses/package-metadata.md\n"
+    "- PyPI JSON API (release file URLs) — https://docs.pypi.org/api/json/\n"
+    "- Maven Central publishing requirements — https://central.sonatype.org/publish/requirements/\n"
+    "- NuGet v3 flat container — https://learn.microsoft.com/nuget/api/package-base-address-resource\n"
+    "- RubyGems downloads — https://guides.rubygems.org/rubygems-org-api/\n"
     "- Go module proxy — https://go.dev/ref/mod#module-proxy\n"
+)
