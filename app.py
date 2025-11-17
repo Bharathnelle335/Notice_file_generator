@@ -7,11 +7,10 @@ Streamlit SBOM → NOTICE generator
   1) Offline mode: "Generate (from scanned SBOM only)"
      *Produces NOTICE.md without external network calls.*
   2) Online mode: "Generate (fetch from internet)"
-     *Fetches SPDX license texts and package artifacts (npm/PyPI/Maven/GitHub)
+     *Fetches SPDX license texts and package artifacts (npm/PyPI/Maven/NuGet/RubyGems/Golang)
       to enrich license texts & copyrights.*
 
-Notes:
-- This automates attribution but is not legal advice—review final NOTICE for completeness.
+Disclaimer: This automates attribution but is not legal advice—review final NOTICE for completeness.
 """
 
 import io
@@ -26,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 from packaging.version import parse as parse_version
+from requests.utils import quote  # for URL-encoding module paths (Go proxy)
 
 # --------------------------- Constants ---------------------------
 
@@ -71,7 +71,7 @@ go_online  = col2.button("🌐 Generate (fetch from internet)", type="secondary"
 
 st.caption("""
 **Tip:** Offline mode never calls external APIs.  
-Online mode fetches canonical SPDX license texts and attempts to download published artifacts (npm/PyPI/Maven/GitHub) to extract `LICENSE` / `NOTICE` / `COPYRIGHT`.
+Online mode fetches canonical SPDX license texts and attempts to download published artifacts (npm/PyPI/Maven/NuGet/RubyGems/Go) to extract `LICENSE` / `NOTICE` / `COPYRIGHT`.
 """)
 
 # ------------------------ Helpers -------------------------------
@@ -123,7 +123,7 @@ def resolve_spdx_urls(pkg: dict) -> Tuple[Optional[str], Optional[str]]:
 
 def parse_spdx(doc: dict) -> Tuple[List[dict], Dict[str,str]]:
     comps, license_texts = [], {}
-    # Extracted license texts (if embedded in SBOM)
+    # SPDX extracted license texts (if present)
     for lic in doc.get("hasExtractedLicensingInfos") or []:
         lid = normalize(lic.get("licenseId")); text = lic.get("extractedText")
         if lid and text:
@@ -259,7 +259,7 @@ def split_license_expression(expr: str) -> List[str]:
 
 def extract_texts_from_archive_bytes(buf: bytes) -> Dict[str,str]:
     texts = {}
-    # Try tar archives (npm tgz or sdist tar.gz)
+    # Try tar archives (npm tgz or sdist tar.gz / RubyGems inner tar)
     try:
         fileobj = io.BytesIO(buf)
         with tarfile.open(fileobj=fileobj, mode="r:*") as tf:
@@ -274,12 +274,13 @@ def extract_texts_from_archive_bytes(buf: bytes) -> Dict[str,str]:
         if texts: return texts
     except Exception:
         pass
-    # Try zip/jar archives (Maven)
+    # Try zip/jar archives (Maven, NuGet, Go module zip)
     try:
         with zipfile.ZipFile(io.BytesIO(buf)) as zf:
             for nm in zf.namelist():
                 base = os.path.basename(nm)
-                if base.upper().startswith(("LICENSE","NOTICE","COPYING","COPYRIGHT")) or "LICENSE" in base.upper() or "NOTICE" in base.upper():
+                up = base.upper()
+                if up.startswith(("LICENSE","NOTICE","COPYING","COPYRIGHT")) or "LICENSE" in up or "NOTICE" in up or "COPYRIGHT" in up or "COPYING" in up or "META-INF" in up:
                     with zf.open(nm) as f:
                         data = f.read().decode("utf-8", errors="replace").strip()
                         if data:
@@ -289,12 +290,12 @@ def extract_texts_from_archive_bytes(buf: bytes) -> Dict[str,str]:
         pass
     return texts
 
+# ---------- Ecosystem fetchers (Online Mode) ----------
+
 @st.cache_data(show_spinner=False)
 def fetch_npm_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
     texts = {}
     try:
-        # npm registry metadata → dist.tarball (published package tarball)
-        # ref: npm registry docs
         url = f"https://registry.npmjs.org/{name}/{version or ''}"
         r = requests.get(url, timeout=REQ_TIMEOUT)
         if r.status_code != 200: return texts
@@ -314,7 +315,6 @@ def fetch_npm_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
 def fetch_pypi_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
     texts = {}
     try:
-        # PyPI JSON API → sdist URLs
         ver = version or ""
         url = f"https://pypi.org/pypi/{name}/{ver}/json" if ver else f"https://pypi.org/pypi/{name}/json"
         r = requests.get(url, timeout=REQ_TIMEOUT)
@@ -350,6 +350,79 @@ def fetch_maven_license_texts(group: str, artifact: str, version: str) -> Dict[s
     return texts
 
 @st.cache_data(show_spinner=False)
+def fetch_nuget_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
+    """
+    NuGet v3 flat container: https://api.nuget.org/v3-flatcontainer/<id>/<version>/<id>.<version>.nupkg
+    .nupkg is a ZIP; license files typically included in package content.
+    """
+    texts = {}
+    try:
+        if not version: return texts
+        lower = name.lower()
+        url = f"https://api.nuget.org/v3-flatcontainer/{lower}/{version}/{lower}.{version}.nupkg"
+        r = requests.get(url, timeout=REQ_TIMEOUT)
+        if r.status_code == 200:
+            texts.update(extract_texts_from_archive_bytes(r.content))
+    except Exception:
+        pass
+    return texts
+
+@st.cache_data(show_spinner=False)
+def fetch_rubygems_license_texts(name: str, version: Optional[str]) -> Dict[str,str]:
+    """
+    RubyGems download URL: https://rubygems.org/downloads/<name>-<version>.gem
+    .gem is a tar containing metadata.gz and data.tar.gz; license files in data.tar.gz.
+    """
+    texts = {}
+    try:
+        if not version: return texts
+        url = f"https://rubygems.org/downloads/{name}-{version}.gem"
+        r = requests.get(url, timeout=REQ_TIMEOUT)
+        if r.status_code != 200: return texts
+        # .gem is a tar; open and find data.tar.gz
+        fileobj = io.BytesIO(r.content)
+        with tarfile.open(fileobj=fileobj, mode="r:*") as tf:
+            for m in tf.getmembers():
+                if os.path.basename(m.name).endswith("data.tar.gz"):
+                    f = tf.extractfile(m)
+                    if not f: continue
+                    buf = f.read()
+                    # open nested tar.gz
+                    inner = io.BytesIO(buf)
+                    with tarfile.open(fileobj=inner, mode="r:*") as inner_tf:
+                        for im in inner_tf.getmembers():
+                            base = os.path.basename(im.name)
+                            if base.upper().startswith(("LICENSE","NOTICE","COPYING","COPYRIGHT")) and im.isfile():
+                                cf = inner_tf.extractfile(im)
+                                if cf:
+                                    data = cf.read().decode("utf-8", errors="replace").strip()
+                                    if data:
+                                        texts[base] = data
+        return texts
+    except Exception:
+        pass
+    return texts
+
+@st.cache_data(show_spinner=False)
+def fetch_golang_license_texts(module_path: str, version: Optional[str]) -> Dict[str,str]:
+    """
+    Go proxy zip: https://proxy.golang.org/<module>/@v/<version>.zip
+    The zip contains the module source; license files typically at root or submodules.
+    """
+    texts = {}
+    try:
+        if not version: return texts
+        # URL-encode module path (keep slashes)
+        mod_encoded = quote(module_path, safe="/")
+        url = f"https://proxy.golang.org/{mod_encoded}/@v/{version}.zip"
+        r = requests.get(url, timeout=REQ_TIMEOUT)
+        if r.status_code == 200:
+            texts.update(extract_texts_from_archive_bytes(r.content))
+    except Exception:
+        pass
+    return texts
+
+@st.cache_data(show_spinner=False)
 def fetch_github_license(repo_url: str) -> Dict[str,str]:
     texts = {}
     try:
@@ -369,23 +442,44 @@ def fetch_github_license(repo_url: str) -> Dict[str,str]:
 
 def fetch_license_texts_by_purl(purl: Optional[str], name: Optional[str], version: Optional[str], source_url: Optional[str]) -> Dict[str,str]:
     texts = {}
-    if purl and purl.startswith("pkg:npm/"):
-        pkg = purl.split("/",2)[-1]
-        pkg = pkg.split("@")[0] if "@" in pkg else pkg
-        ver = version or (purl.split("@")[-1] if "@" in purl else None)
-        texts.update(fetch_npm_license_texts(pkg, ver))
-    elif purl and purl.startswith("pkg:pypi/"):
-        pkg = purl.split("/",2)[-1].split("@")[0]
-        ver = version or (purl.split("@")[-1] if "@" in purl else None)
-        texts.update(fetch_pypi_license_texts(pkg, ver))
-    elif purl and purl.startswith("pkg:maven/"):
-        rest = purl[len("pkg:maven/"):]
-        parts = rest.split("@")[0].split("/")
-        if len(parts)>=2 and version:
-            group, artifact = parts[0], parts[1]
-            texts.update(fetch_maven_license_texts(group, artifact, version))
-    if not texts and source_url and "github.com" in source_url:
-        texts.update(fetch_github_license(source_url))
+    try:
+        if purl and purl.startswith("pkg:npm/"):
+            pkg = purl.split("/",2)[-1]
+            pkg = pkg.split("@")[0] if "@" in pkg else pkg
+            ver = version or (purl.split("@")[-1] if "@" in purl else None)
+            texts.update(fetch_npm_license_texts(pkg, ver))
+        elif purl and purl.startswith("pkg:pypi/"):
+            pkg = purl.split("/",2)[-1].split("@")[0]
+            ver = version or (purl.split("@")[-1] if "@" in purl else None)
+            texts.update(fetch_pypi_license_texts(pkg, ver))
+        elif purl and purl.startswith("pkg:maven/"):
+            rest = purl[len("pkg:maven/"):]
+            parts = rest.split("@")[0].split("/")
+            if len(parts)>=2 and version:
+                group, artifact = parts[0], parts[1]
+                texts.update(fetch_maven_license_texts(group, artifact, version))
+        elif purl and purl.startswith("pkg:nuget/"):
+            pkg = purl.split("/",2)[-1]
+            pkg = pkg.split("@")[0] if "@" in pkg else pkg
+            ver = version or (purl.split("@")[-1] if "@" in purl else None)
+            texts.update(fetch_nuget_license_texts(pkg, ver))
+        elif purl and purl.startswith("pkg:gem/"):
+            pkg = purl.split("/",2)[-1]
+            pkg = pkg.split("@")[0] if "@" in pkg else pkg
+            ver = version or (purl.split("@")[-1] if "@" in purl else None)
+            texts.update(fetch_rubygems_license_texts(pkg, ver))
+        elif purl and purl.startswith("pkg:golang/"):
+            # module path may include slashes
+            rest = purl[len("pkg:golang/"):]
+            module = rest.split("@")[0]
+            ver = version or (purl.split("@")[-1] if "@" in purl else None)
+            texts.update(fetch_golang_license_texts(module, ver))
+
+        # Fallback via GitHub repo URL (if provided)
+        if not texts and source_url and "github.com" in source_url:
+            texts.update(fetch_github_license(source_url))
+    except Exception:
+        pass
     return texts
 
 def extract_copyright_lines(text: str, max_lines: int = 8) -> Optional[str]:
@@ -502,7 +596,7 @@ def generate_notice_online(uploaded_files, title: str, include_spdx_texts: bool)
                     if txt:
                         appended_texts[lid] = txt
 
-        # 3) Fetch upstream license/notice files via ecosystem (npm/PyPI/Maven) or GitHub
+        # 3) Fetch upstream license/notice files via ecosystem (npm/PyPI/Maven/NuGet/RubyGems/Golang) or GitHub
         fetched = fetch_license_texts_by_purl(c.get("purl"), c.get("name"), c.get("version"), c.get("source_url"))
         if fetched:
             # If we only have license files (no SPDX id), mark license conservatively
@@ -548,15 +642,13 @@ if go_online:
 # ------------------------ Footnotes ------------------------------
 
 st.divider()
-st.markdown("""
-### References
-- **SPDX License List / Tools**: canonical license texts & tools ecosystem.  
-  https://spdx.dev/use/spdx-tools/  \n
-- **Package URL (PURL) specification**: standard identifier used in SBOMs.  
-  https://github.com/package-url/purl-spec  \n
-- **npm registry metadata**: `dist.tarball` endpoint for published package tarballs.  
-  https://github.com/npm/registry/blob/main/docs/responses/package-metadata.md  \n
-- **PyPI JSON API**: release file URLs (sdist/wheel) for packages.  
-  https://docs.pypi.org/api/json/  \n
-- **Maven Central**: sources/javadocs often provided by publishing requirements.  
-  https://central.sonatype.org/publish/requirements/
+st.markdown(
+    "### References\n"
+    "- SPDX License List / Tools: canonical license texts & tools ecosystem — https://spdx.dev/use/spdx-tools/\n\n"
+    "- Package URL (PURL) specification — https://github.com/package-url/purl-spec\n\n"
+    "- npm registry metadata (dist.tarball) — https://github.com/npm/registry/blob/main/docs/responses/package-metadata.md\n\n"
+    "- PyPI JSON API (release file URLs) — https://docs.pypi.org/api/json/\n\n"
+    "- Maven Central publishing requirements (sources/javadocs) — https://central.sonatype.org/publish/requirements/\n\n"
+    "- NuGet v3 flat container (nupkg download) — https://learn.microsoft.com/nuget/api/package-base-address-resource\n\n"
+    "- RubyGems downloads — https://guides.rubygems.org/rubygems-org-api/\n\n"
+    "- Go module proxy — https://go.dev/ref/mod#module-proxy\n"
